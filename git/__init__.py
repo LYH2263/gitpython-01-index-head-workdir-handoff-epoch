@@ -24,6 +24,8 @@ __all__ = [
     "DiffIndex",
     "Diffable",
     "FetchInfo",
+    "GenerationHandoffError",
+    "GenerationLedger",
     "Git",
     "GitCmdObjectDB",
     "GitCommandError",
@@ -31,6 +33,7 @@ __all__ = [
     "GitConfigParser",
     "GitDB",
     "GitError",
+    "HandoffGeneration",
     "HEAD",
     "Head",
     "HookExecutionError",
@@ -105,6 +108,7 @@ from git.exc import (
     CacheError,
     CheckoutError,
     CommandError,
+    GenerationHandoffError,
     GitCommandError,
     GitCommandNotFound,
     GitError,
@@ -121,6 +125,7 @@ from git.exc import (
     UnsupportedOperation,
     WorkTreeRepositoryUnsupported,
 )
+from git.handoff import GenerationLedger, HandoffGeneration
 from git.types import PathLike
 
 try:

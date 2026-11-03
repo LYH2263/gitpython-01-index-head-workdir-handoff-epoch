@@ -8,6 +8,9 @@ Note the distinction between the :class:`HEAD` and :class:`Head` classes.
 
 __all__ = ["HEAD", "Head"]
 
+import contextlib
+import os
+
 from git.config import GitConfigParser, SectionConstraint
 from git.exc import GitCommandError
 from git.util import join_path
@@ -17,12 +20,13 @@ from .symbolic import SymbolicReference
 
 # typing ---------------------------------------------------
 
-from typing import Any, Sequence, TYPE_CHECKING, Union
+from typing import Any, cast, List, Sequence, Set, TYPE_CHECKING, Union
 
 from git.cmd import Git
 from git.types import Commit_ish, PathLike
 
 if TYPE_CHECKING:
+    from git.objects import Commit
     from git.refs import RemoteReference
     from git.repo import Repo
 
@@ -120,16 +124,76 @@ class HEAD(SymbolicReference):
 
         # END working tree handling
 
-        try:
-            self.repo.git.reset(mode, commit, "--", paths, **kwargs)
-        except GitCommandError as e:
-            # git nowadays may use 1 as status to indicate there are still unstaged
-            # modifications after the reset.
-            if e.status != 1:
-                raise
-        # END handle exception
+        # Generation channels. ``git reset <paths>`` never moves the tip, whereas the
+        # full-tree soft/mixed/hard modes all do; soft does not touch the index, the
+        # other modes do; only hard touches worktree files. The three forks are
+        # recorded separately instead of collapsing commit/tip/index/worktree into a
+        # single switch.
+        generations = getattr(self.repo, "generations", None)
+        gen = None if generations is None else generations.current
+        moved_tip = not paths
+        reset_paths: List[str] = []
+        if paths is not None:
+            if isinstance(paths, (str, os.PathLike)):
+                reset_paths = [os.fspath(paths)]
+            else:
+                reset_paths = [os.fspath(path) for path in paths]
+
+        if gen is not None:
+            if moved_tip:
+                # Tip channel: previous HEAD/branch/ORIG_HEAD states for rollback.
+                gen.snapshot_tip_refs(self.repo)
+            if mode == "--hard":
+                # Worktree channel: snapshot exactly the files hard reset rewrites.
+                for rel_path in self._handoff_hard_reset_paths(commit):
+                    gen.snapshot_worktree(self.repo, [rel_path])
+
+        # Soft reset never touches the index, so it must not be redirected; the
+        # mixed/hard and path-limited modes update the index and write to the active
+        # generation's private index file instead of the repository index.
+        redirect_index = gen is not None and mode != "--soft"
+        reset_env = (
+            gen.porcelain_environment(self.repo.git)  # type: ignore[union-attr]
+            if redirect_index
+            else contextlib.nullcontext()
+        )
+        with reset_env:
+            try:
+                self.repo.git.reset(mode, commit, "--", paths, **kwargs)
+            except GitCommandError as e:
+                # git nowadays may use 1 as status to indicate there are still unstaged
+                # modifications after the reset.
+                if e.status != 1:
+                    raise
+            # END handle exception
+        if gen is not None:
+            gen.record_reset(mode, reset_paths, moved_tip)
 
         return self
+
+    def _handoff_hard_reset_paths(self, commit: Union[Commit_ish, SymbolicReference, str]) -> List[str]:
+        """Worktree paths a hard reset to `commit` will create, modify, or delete.
+
+        These are the paths the worktree channel has to snapshot beforehand so a
+        generation that fails can restore the pre-reset working tree.
+        """
+        target = self.repo.commit(cast(Union[str, "Commit"], commit))
+        try:
+            current = self.commit
+        except ValueError:
+            # Unborn HEAD: hard reset materializes every blob of the target tree.
+            return [
+                cast(str, getattr(obj, "path"))
+                for obj in target.tree.traverse()
+                if getattr(obj, "type", None) == "blob"
+            ]
+        changed: Set[str] = set()
+        for diff in current.diff(target):
+            if diff.a_path is not None:
+                changed.add(diff.a_path)
+            if diff.b_path is not None:
+                changed.add(diff.b_path)
+        return sorted(changed)
 
 
 class Head(Reference):

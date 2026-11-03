@@ -31,6 +31,7 @@ from git.exc import (
     InvalidGitRepositoryError,
     NoSuchPathError,
 )
+from git.handoff import GenerationLedger
 from git.index import IndexFile
 from git.objects import Submodule, RootModule, Commit
 from git.refs import HEAD, Head, Reference, TagReference
@@ -85,6 +86,9 @@ from typing import (
 from git.types import ConfigLevels_Tup, TypedDict
 
 if TYPE_CHECKING:
+    import contextlib
+
+    from git.handoff import HandoffGeneration
     from git.objects import Tree
     from git.objects.submodule.base import UpdateProgress
     from git.refs.symbolic import SymbolicReference
@@ -423,6 +427,10 @@ class Repo:
                 )
             self.odb = odbt(rootpath)
 
+        # Per-git-directory ledger for index/HEAD/worktree handoff generations. It is
+        # inert until generations.scope() is entered and adds no required parameters.
+        self._generations = GenerationLedger.bind(self)
+
     def __enter__(self) -> "Repo":
         return self
 
@@ -557,6 +565,35 @@ class Repo:
             :class:`~git.refs.head.HEAD` object pointing to the current head reference
         """
         return HEAD(self, "HEAD")
+
+    @property
+    def generations(self) -> GenerationLedger:
+        """
+        :return:
+            The :class:`~git.handoff.GenerationLedger` mounted on this repository.
+
+        The ledger is shared between :class:`Repo` instances that open the same git
+        directory and is inert while no generation scope is active, in which case
+        :meth:`~git.handoff.GenerationLedger.current` is ``None`` and index, tip and
+        worktree operations behave as usual.
+        """
+        return self._generations
+
+    def generation_scope(
+        self,
+    ) -> "contextlib.AbstractContextManager[HandoffGeneration]":
+        """Open an index/HEAD/worktree handoff generation on this repository.
+
+        See :meth:`GenerationLedger.scope <git.handoff.GenerationLedger.scope>` for
+        the handoff and rollback semantics. Generations nest: a body that raises
+        rolls back only its own side effects, while a body that finishes cleanly
+        hands its index to the enclosing generation.
+
+        :return:
+            Context manager yielding the active
+            :class:`~git.handoff.HandoffGeneration`.
+        """
+        return self._generations.scope()
 
     @property
     def remotes(self) -> "IterableList[Remote]":

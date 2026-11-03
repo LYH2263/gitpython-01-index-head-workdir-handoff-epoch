@@ -27,6 +27,7 @@ from typing import (
     Any,
     Iterator,
     List,
+    Optional,
     TYPE_CHECKING,
     Tuple,
     Type,
@@ -39,6 +40,7 @@ from git.types import AnyGitObject, PathLike
 
 if TYPE_CHECKING:
     from git.config import GitConfigParser
+    from git.handoff import HandoffGeneration
     from git.objects.commit import Actor
     from git.refs.log import RefLogEntry
     from git.refs.reference import Reference
@@ -482,6 +484,35 @@ class SymbolicReference:
             )
         return cast("Reference", self.from_path(self.repo, target_ref_path))
 
+    def _handoff_tip_generation(self) -> "Optional[HandoffGeneration]":
+        """If an active generation tracks this ref as the tip, snapshot it.
+
+        The tip channel covers ``HEAD`` itself, ``ORIG_HEAD`` and the branch
+        ``HEAD`` is attached to; other refs (such as tags) are not part of a
+        HEAD/worktree handoff. Returning the generation lets the caller skip any
+        further tip-channel work when no generation is active.
+        """
+        generations = getattr(self.repo, "generations", None)
+        if generations is None:
+            return None
+        gen = generations.current
+        if gen is None:
+            return None
+        path = os.fspath(self.path)
+        tracked = {"HEAD", "ORIG_HEAD"}
+        head_file = os.path.join(os.fspath(self.repo.git_dir), "HEAD")
+        try:
+            with open(head_file, "rb") as fp:
+                head_text = fp.read().decode("utf-8", "replace").strip()
+        except OSError:
+            head_text = ""
+        if head_text.startswith("ref:"):
+            tracked.add(head_text.split(":", 1)[1].strip())
+        if path in tracked:
+            gen.snapshot_ref(self.repo, path)
+            return gen
+        return None
+
     def set_reference(
         self,
         ref: Union[AnyGitObject, "SymbolicReference", str],
@@ -546,6 +577,12 @@ class SymbolicReference:
                 oldbinsha = Commit.NULL_BIN_SHA
             # END handle non-existing
         # END retrieve old hexsha
+
+        # Tip-channel hook: inside an active generation the previous state of HEAD
+        # (or the branch it is attached to) is recorded before the native ref write,
+        # so a generation that fails can move the tip back. This is distinct from
+        # HEAD.reset's porcelain exit; both channels snapshot through the ledger.
+        self._handoff_tip_generation()
 
         fpath = self._get_validated_ref_path(self.repo, self.path)
         assure_directory_exists(fpath, is_file=True)

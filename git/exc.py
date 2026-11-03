@@ -30,6 +30,7 @@ __all__ = [
     "UnmergedEntriesError",
     "HookExecutionError",
     "RepositoryDirtyError",
+    "GenerationHandoffError",
 ]
 
 from gitdb.exc import (
@@ -226,3 +227,11 @@ class RepositoryDirtyError(GitError):
 
     def __str__(self) -> str:
         return "Operation cannot be performed on %r: %s" % (self.repo, self.message)
+
+
+class GenerationHandoffError(GitError):
+    """Thrown when a handoff generation is advanced or used out of order.
+
+    A sealed :class:`~git.handoff.HandoffGeneration` cannot be advanced again, and a
+    generation can only be advanced while it is the active generation of its ledger.
+    """

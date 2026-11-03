@@ -69,6 +69,7 @@ from typing import (
     Iterator,
     List,
     NoReturn,
+    Optional,
     Sequence,
     TYPE_CHECKING,
     Tuple,
@@ -80,6 +81,7 @@ from git.types import Literal, PathLike
 if TYPE_CHECKING:
     from subprocess import Popen
 
+    from git.handoff import HandoffGeneration
     from git.refs.reference import Reference
     from git.repo import Repo
 
@@ -137,7 +139,7 @@ class IndexFile(LazyMixin, git_diff.Diffable, Serializable):
     unsafe_git_checkout_index_options = ["--prefix"]
     unsafe_git_read_tree_options = ["--index-output"]
 
-    __slots__ = ("repo", "version", "entries", "_extension_data", "_file_path")
+    __slots__ = ("repo", "version", "_entries_impl", "_extension_data", "_file_path", "_handoff_stamp")
 
     _VERSION = 2
     """The latest version we support."""
@@ -157,11 +159,66 @@ class IndexFile(LazyMixin, git_diff.Diffable, Serializable):
         self.version = self._VERSION
         self._extension_data = b""
         self._file_path: PathLike = file_path or self._index_path()
+        self._handoff_stamp: Optional[Tuple[int, int]] = None
+
+    def _handoff_generation(self) -> Optional["HandoffGeneration"]:
+        """:return: The active handoff generation for our repository, if any."""
+        generations = getattr(self.repo, "generations", None)
+        return None if generations is None else generations.current
+
+    @property
+    def entries(self) -> Dict[Tuple[PathLike, StageType], IndexEntry]:
+        """Index entries, transparently bound to the active generation ledger.
+
+        Reading the attribute drops and reloads the cache when the active generation
+        changed (a barrier was advanced, a nested scope republished our index file,
+        or the generation scope ended), so even a long-lived ``IndexFile`` instance
+        cannot serve entries from a sealed generation.
+        """
+        gen = self._handoff_generation()
+        token = None if gen is None else gen.token
+        if self._handoff_stamp != token:
+            self._delete_entries_cache()
+            self._handoff_stamp = token
+        try:
+            return self._entries_impl
+        except AttributeError:
+            self._set_cache_("entries")
+            return self._entries_impl
+
+    @entries.setter
+    def entries(self, entries: Dict[Tuple[PathLike, StageType], IndexEntry]) -> None:
+        # An explicit assignment belongs to the generation that is current now.
+        gen = self._handoff_generation()
+        self._handoff_stamp = None if gen is None else gen.token
+        self._entries_impl = entries
+
+    def _handoff_sync(self) -> Optional["HandoffGeneration"]:
+        """Bind the in-memory entry cache to the active generation's ledger.
+
+        Returns the active generation (or ``None``), dropping the cached entries when
+        the active generation changed (a barrier was advanced, or a nested scope
+        republished the enclosing generation's index file).
+        """
+        gen = self._handoff_generation()
+        self.entries  # noqa: B018 # Trigger token alignment and lazy (re)loading.
+        return gen
+
+    def _handoff_index_path(self) -> PathLike:
+        """Index file this instance must read/write under the active generation.
+
+        Only the default index is redirected; indices explicitly bound to another
+        file keep their own path.
+        """
+        gen = self._handoff_generation()
+        if gen is not None and self._file_path == self._index_path():
+            return gen.index_path
+        return self._file_path
 
     def _set_cache_(self, attr: str) -> None:
         if attr == "entries":
             try:
-                fd = os.open(self._file_path, os.O_RDONLY)
+                fd = os.open(self._handoff_index_path(), os.O_RDONLY)
             except OSError:
                 # In new repositories, there may be no index, which means we are empty.
                 self.entries: Dict[Tuple[PathLike, StageType], IndexEntry] = {}
@@ -191,10 +248,9 @@ class IndexFile(LazyMixin, git_diff.Diffable, Serializable):
     def _delete_entries_cache(self) -> None:
         """Safely clear the entries cache so it can be recreated."""
         try:
-            del self.entries
+            del self._entries_impl
         except AttributeError:
-            # It failed in Python 2.6.5 with AttributeError.
-            # FIXME: Look into whether we can just remove this except clause now.
+            # The entries cache has not been materialized yet.
             pass
         # END exception handling
 
@@ -240,11 +296,18 @@ class IndexFile(LazyMixin, git_diff.Diffable, Serializable):
             :manpage:`git-write-tree(1)` will instead write the stored/cached tree.
             Alternatively, use :meth:`write_tree` to handle this case automatically.
         """
+        gen = self._handoff_sync()
         # Make sure we have our entries read before getting a write lock.
         # Otherwise it would be done when streaming.
         # This can happen if one doesn't change the index, but writes it right away.
         self.entries  # noqa: B018
-        lfd = LockedFD(file_path or self._file_path)
+        if file_path is None and gen is not None:
+            # Default writes inside a generation materialize on its private ledger so
+            # they cannot reach the repository index before the generation hands off.
+            target_path: PathLike = gen.index_path
+        else:
+            target_path = file_path or self._file_path
+        lfd = LockedFD(target_path)
         stream = lfd.open(write=True, stream=True)
 
         try:
@@ -307,7 +370,9 @@ class IndexFile(LazyMixin, git_diff.Diffable, Serializable):
             args.append(base)
         args.append(rhs)
 
-        self.repo.git.read_tree(args)
+        gen = self._handoff_sync()
+        with gen.porcelain_environment(self.repo.git) if gen is not None else contextlib.nullcontext():
+            self.repo.git.read_tree(args)
         return self
 
     @classmethod
@@ -412,6 +477,12 @@ class IndexFile(LazyMixin, git_diff.Diffable, Serializable):
 
         # Create the temporary file in the .git directory to be sure renaming
         # works - /tmp/ directories could be on another device.
+        generations = getattr(repo, "generations", None)
+        gen = None if generations is None else generations.current
+        # Inside a generation the effective default index is its private ledger file;
+        # that is what has to be moved out of read-tree's way, while GIT_INDEX_FILE
+        # points porcelain at the same private file.
+        default_index_path = gen.index_path if gen is not None else join_path_native(repo.git_dir, "index")
         with _named_temporary_file_for_subprocess(repo.git_dir) as tmp_index:
             arg_list.append("--index-output=%s" % tmp_index)
             arg_list.extend(treeish)
@@ -420,8 +491,10 @@ class IndexFile(LazyMixin, git_diff.Diffable, Serializable):
             # considers existing entries. Moving it essentially clears the index.
             # Unfortunately there is no 'soft' way to do it.
             # The TemporaryFileSwap ensures the original file gets put back.
-            with TemporaryFileSwap(join_path_native(repo.git_dir, "index")):
-                repo.git.read_tree(*arg_list, **kwargs)
+            with TemporaryFileSwap(default_index_path):
+                env = gen.porcelain_environment(repo.git) if gen is not None else contextlib.nullcontext()
+                with env:
+                    repo.git.read_tree(*arg_list, **kwargs)
                 index = cls(repo, tmp_index)
                 index.entries  # noqa: B018 # Force it to read the file as we will delete the temp-file.
                 return index
@@ -647,6 +720,7 @@ class IndexFile(LazyMixin, git_diff.Diffable, Serializable):
             self
         """
         self._delete_entries_cache()
+        self._handoff_stamp = None
         # Allows to lazily reread on demand.
         return self
 
@@ -669,6 +743,9 @@ class IndexFile(LazyMixin, git_diff.Diffable, Serializable):
         """
         # We obtain no lock as we just flush our contents to disk as tree.
         # If we are a new index, the entries access will load our data accordingly.
+        # Inside a generation this binds the entries to the generation ledger, so a
+        # tree can only contain staging of the currently active generation.
+        self._handoff_sync()
         mdb = MemoryDB()
         entries = self._entries_sorted()
         binsha, tree_items = write_tree_from_cache(entries, mdb, slice(0, len(entries)))
@@ -958,6 +1035,10 @@ class IndexFile(LazyMixin, git_diff.Diffable, Serializable):
             :class:`~git.index.typ.BaseIndexEntry` objects that do not have a null sha
             will be added even if their paths do not exist.
         """
+        # Bind the entry cache to the active generation before any mutation, so new
+        # entries are layered on top of the generation-private index and the implied
+        # self.write() below materializes on the generation ledger.
+        self._handoff_sync()
         # Sort the entries into strings and Entries.
         # Blobs are converted to entries automatically.
         # Paths can be git-added. For everything else we use git-update-index.
@@ -1123,7 +1204,13 @@ class IndexFile(LazyMixin, git_diff.Diffable, Serializable):
 
         # Preprocess paths.
         paths = list(map(os.fspath, self._items_to_rela_paths(items)))  # type: ignore[arg-type]
-        removed_paths = self.repo.git.rm(args, paths, **kwargs).splitlines()
+        gen = self._handoff_sync()
+        # ``git rm`` (without --cached) deletes the worktree files too: record them so
+        # a failing generation can put the deleted files back.
+        if gen is not None and working_tree:
+            gen.snapshot_worktree(self.repo, paths)
+        with gen.porcelain_environment(self.repo.git) if gen is not None else contextlib.nullcontext():
+            removed_paths = self.repo.git.rm(args, paths, **kwargs).splitlines()
 
         # Process output to gain proper paths.
         # rm 'path'
@@ -1193,10 +1280,20 @@ class IndexFile(LazyMixin, git_diff.Diffable, Serializable):
         was_dry_run = kwargs.pop("dry_run", kwargs.pop("n", None))
         kwargs["dry_run"] = True
 
+        gen = self._handoff_sync()
+
+        # The porcelain environment is a one-shot context manager, so build a fresh
+        # one for the dry run and for the actual rename.
+        def mv_env() -> Any:
+            if gen is None:
+                return contextlib.nullcontext()
+            return gen.porcelain_environment(self.repo.git)
+
         # First execute rename in dry run so the command tells us what it actually does
         # (for later output).
         out = []
-        mvlines = self.repo.git.mv(args, paths, **kwargs).splitlines()
+        with mv_env():
+            mvlines = self.repo.git.mv(args, paths, **kwargs).splitlines()
 
         # Parse result - first 0:n/2 lines are 'checking ', the remaining ones are the
         # 'renaming' ones which we parse.
@@ -1214,9 +1311,15 @@ class IndexFile(LazyMixin, git_diff.Diffable, Serializable):
             return out
         # END handle dry run
 
+        # Snapshot the working-tree side of the rename (source contents and target
+        # absence) so a failing generation can undo it on its own ledger.
+        if gen is not None:
+            gen.snapshot_worktree(self.repo, [src for src, _ in out] + [dst for _, dst in out])
+
         # Now apply the actual operation.
         kwargs.pop("dry_run")
-        self.repo.git.mv(args, paths, **kwargs)
+        with mv_env():
+            self.repo.git.mv(args, paths, **kwargs)
 
         return out
 
@@ -1249,6 +1352,7 @@ class IndexFile(LazyMixin, git_diff.Diffable, Serializable):
         :return:
             :class:`~git.objects.commit.Commit` object representing the new commit
         """
+        gen = self._handoff_sync()
         if not skip_hooks:
             run_commit_hook("pre-commit", self)
 
@@ -1269,6 +1373,12 @@ class IndexFile(LazyMixin, git_diff.Diffable, Serializable):
             commit_date=commit_date,
             trailers=trailers,
         )
+        if gen is not None and rval:
+            # commit is the cross-generation materialization point of the index
+            # channel (as opposed to a tip-only HEAD.reset): flush the committed
+            # entries onto the generation ledger and rebase later generations on it.
+            self.write(ignore_extension_data=True)
+            gen.note_commit(rval.hexsha)
         if not skip_hooks:
             run_commit_hook("post-commit", self)
         return rval
@@ -1431,14 +1541,20 @@ class IndexFile(LazyMixin, git_diff.Diffable, Serializable):
         # END stderr handler
 
         # Read and validate the index before Git trusts its paths for checkout.
-        self._delete_entries_cache()
+        gen = self._handoff_sync()
         self.entries  # noqa: B018
+        co_env = gen.porcelain_environment(self.repo.git) if gen is not None else contextlib.nullcontext()
         if paths is None:
             args.append("--all")
             kwargs["as_process"] = 1
+            # --all can overwrite every tracked worktree path: snapshot them before
+            # the porcelain writes, so a failing generation can take them back.
+            if gen is not None:
+                gen.snapshot_worktree(self.repo, [e.path for e in self.entries.values()])
             fprogress(None, False, None)
-            proc = self.repo.git.checkout_index(*args, **kwargs)
-            proc.wait()
+            with co_env:
+                proc = self.repo.git.checkout_index(*args, **kwargs)
+                proc.wait()
             fprogress(None, True, None)
             rval_iter = (e.path for e in self.entries.values())
             handle_stderr(proc, rval_iter)
@@ -1456,52 +1572,58 @@ class IndexFile(LazyMixin, git_diff.Diffable, Serializable):
             args.append("--stdin")
             kwargs["as_process"] = True
             kwargs["istream"] = subprocess.PIPE
-            proc = self.repo.git.checkout_index(args, **kwargs)
+            with co_env:
+                proc = self.repo.git.checkout_index(args, **kwargs)
 
-            # FIXME: Reading from GIL!
-            def make_exc() -> GitCommandError:
-                return GitCommandError(("git-checkout-index", *args), 128, proc.stderr.read())
+                # FIXME: Reading from GIL!
+                def make_exc() -> GitCommandError:
+                    return GitCommandError(("git-checkout-index", *args), 128, proc.stderr.read())
 
-            checked_out_files: List[PathLike] = []
+                checked_out_files: List[PathLike] = []
 
-            for path in paths:
-                co_path = to_native_path_linux(self._to_relative_path(path))
-                # If the item is not in the index, it could be a directory.
-                path_is_directory = False
+                for path in paths:
+                    co_path = to_native_path_linux(self._to_relative_path(path))
+                    # If the item is not in the index, it could be a directory.
+                    path_is_directory = False
 
+                    try:
+                        self.entries[(co_path, 0)]
+                    except KeyError:
+                        folder = co_path
+                        if not folder.endswith("/"):
+                            folder += "/"
+                        for entry in self.entries.values():
+                            if os.fspath(entry.path).startswith(folder):
+                                p = entry.path
+                                if gen is not None:
+                                    gen.snapshot_worktree(self.repo, [p])
+                                self._write_path_to_stdin(proc, p, p, make_exc, fprogress, read_from_stdout=False)
+                                checked_out_files.append(p)
+                                path_is_directory = True
+                            # END if entry is in directory
+                        # END for each entry
+                    # END path exception handlnig
+
+                    if not path_is_directory:
+                        if gen is not None:
+                            gen.snapshot_worktree(self.repo, [co_path])
+                        self._write_path_to_stdin(proc, co_path, path, make_exc, fprogress, read_from_stdout=False)
+                        checked_out_files.append(co_path)
+                    # END path is a file
+                # END for each path
                 try:
-                    self.entries[(co_path, 0)]
-                except KeyError:
-                    folder = co_path
-                    if not folder.endswith("/"):
-                        folder += "/"
-                    for entry in self.entries.values():
-                        if os.fspath(entry.path).startswith(folder):
-                            p = entry.path
-                            self._write_path_to_stdin(proc, p, p, make_exc, fprogress, read_from_stdout=False)
-                            checked_out_files.append(p)
-                            path_is_directory = True
-                        # END if entry is in directory
-                    # END for each entry
-                # END path exception handlnig
+                    self._flush_stdin_and_wait(proc, ignore_stdout=True)
+                except GitCommandError:
+                    # Without parsing stdout we don't know what failed.
+                    raise CheckoutError(  # noqa: B904
+                        "Some files could not be checked out from the index, probably because they didn't exist.",
+                        failed_files,
+                        [],
+                        failed_reasons,
+                    )
 
-                if not path_is_directory:
-                    self._write_path_to_stdin(proc, co_path, path, make_exc, fprogress, read_from_stdout=False)
-                    checked_out_files.append(co_path)
-                # END path is a file
-            # END for each path
-            try:
-                self._flush_stdin_and_wait(proc, ignore_stdout=True)
-            except GitCommandError:
-                # Without parsing stdout we don't know what failed.
-                raise CheckoutError(  # noqa: B904
-                    "Some files could not be checked out from the index, probably because they didn't exist.",
-                    failed_files,
-                    [],
-                    failed_reasons,
-                )
-
-            handle_stderr(proc, checked_out_files)
+                handle_stderr(proc, checked_out_files)
+            # END generation porcelain environment
             return checked_out_files
         # END paths handling
 
@@ -1561,6 +1683,9 @@ class IndexFile(LazyMixin, git_diff.Diffable, Serializable):
         :return:
             self
         """
+        # Bind our cache to the active generation before replacing its entries: the
+        # self.write() below must not resync and discard the freshly read tree.
+        self._handoff_sync()
         # What we actually want to do is to merge the tree into our existing index,
         # which is what git-read-tree does.
         new_inst = type(self).from_tree(self.repo, commit, allow_unsafe_options=allow_unsafe_options)
